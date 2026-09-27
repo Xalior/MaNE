@@ -19,6 +19,8 @@ var inputBuffer = new Float32Array(16384);
 var bufferSize = 16384;
 var start = 0;
 var rear = 0;
+var lastL = 0;
+var lastR = 0;
 var watchDogDateLast = null;
 var watchDogTimerEvent = null;
 
@@ -145,18 +147,21 @@ function tick (event) {
 	}
 	//Copy samples from the input buffer to the Web Audio API:
 	var quantum = buffers[0].length;
-	for (var index = 0; index < quantum && start != rear; ++index) {
-		buffers[0][index] = inputBuffer[start++];
-		buffers[1][index] = inputBuffer[start++];
+	var index = 0;
+	while (index < quantum && start != rear) {
+		lastL = buffers[0][index] = inputBuffer[start++];
+		lastR = buffers[1][index] = inputBuffer[start++];
+		index++;
 		if (start == bufferSize) {
 			start = 0;
 		}
 	}
-	//Pad with latest if we're underrunning:
-	var idx = (index == 0 ? bufferSize : index) - 1;
+	//Pad with the last played frame if we're underrunning (lastL/lastR
+	//start at zero, so a never-filled buffer pads with silence):
 	while (index < quantum) {
-		buffers[0][index] = buffers[0][idx];
-		buffers[1][index++] = buffers[1][idx];
+		buffers[0][index] = lastL;
+		buffers[1][index] = lastR;
+		index++;
 	}
 	//Deep inside the bowels of vendors bugs,
 	//we're using watchdog for a firefox bug,
