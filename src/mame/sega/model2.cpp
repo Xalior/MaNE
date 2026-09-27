@@ -2451,6 +2451,10 @@ void model2_state::sound_ready_w(int state)
 
 /* Model 2 sound board emulation */
 
+// TODO: modernize, bit 3-0 same as model3.cpp and flashbeats.cpp
+// - bit 4 looks always high in at least vstriker, which rules out being banking related
+// - none of the Model 2 games actually has more than 0x800000 of sample data (wtf),
+//   so this will actually never trigger ...
 void model2_state::model2snd_ctrl(u16 data)
 {
 	// handle sample banking
@@ -2470,10 +2474,11 @@ void model2_state::model2snd_ctrl(u16 data)
 	}
 }
 
+// We assume using the same waitstate weights as Saturn, applied to SCSP area only
 void model2_state::model2_snd(address_map &map)
 {
-	map(0x000000, 0x07ffff).ram().share("soundram");
-	map(0x100000, 0x100fff).rw(m_scsp, FUNC(scsp_device::read), FUNC(scsp_device::write));
+	map(0x000000, 0x07ffff).before_delay(NAME([](offs_t) { return 1; })).ram().share("soundram");
+	map(0x100000, 0x100fff).before_delay(NAME([](offs_t) { return 1; })).rw(m_scsp, FUNC(scsp_device::read), FUNC(scsp_device::write));
 	map(0x400000, 0x400001).w(FUNC(model2_state::model2snd_ctrl));
 	map(0x600000, 0x67ffff).rom().region("audiocpu", 0);
 	map(0x800000, 0x9fffff).rom().region("samples", 0);
@@ -2512,7 +2517,7 @@ void model2_state::model2_screen(machine_config &config)
 	m_tiles->xhout_write_callback().set(FUNC(model2_state::horizontal_sync_w));
 	m_tiles->xvout_write_callback().set(FUNC(model2_state::vertical_sync_w));
 
-	SCREEN(config, m_screen, SCREEN_TYPE_RASTER);
+	SCREEN(config, m_screen);
 	m_screen->set_video_attributes(VIDEO_UPDATE_AFTER_VBLANK);
 	// TODO: from System 24, might not be accurate for Model 2
 	m_screen->set_raw(32_MHz_XTAL/2, 656, 0/*+69*/, 496/*+69*/, 424, 0/*+25*/, 384/*+25*/);
@@ -3104,6 +3109,7 @@ void model2c_state::topskatr(machine_config &config)
 	io.an_port_callback<1>().set_ioport("SLIDE");
 
 	DSB2(config, m_dsb2);
+	// TODO: should be chained with SCSP EXTS not being direct
 	m_dsb2->add_route(0, "speaker", 1.0, 0);
 	m_dsb2->add_route(1, "speaker", 1.0, 1);
 
