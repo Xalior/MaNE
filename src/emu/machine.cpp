@@ -1397,6 +1397,7 @@ void system_time::full_time::set(struct tm &t)
 #if defined(__EMSCRIPTEN__)
 
 running_machine * running_machine::emscripten_running_machine;
+static osd_ticks_t s_emscripten_last_realtime = 0;
 
 void running_machine::emscripten_main_loop()
 {
@@ -1404,25 +1405,62 @@ void running_machine::emscripten_main_loop()
 
 	auto profile = g_profiler.start(PROFILER_EXTRA);
 
+	// measure the real interval between callbacks; clamp garbage deltas
+	// (first call, stall, backgrounded tab) to a nominal frame
+	osd_ticks_t const now = osd_ticks();
+	osd_ticks_t const tps = osd_ticks_per_second();
+	osd_ticks_t delta = now - s_emscripten_last_realtime;
+	s_emscripten_last_realtime = now;
+	if (delta < tps / 240 || delta > tps / 15)
+		delta = tps / 60;
+
 	// execute CPUs if not paused
 	if (!machine->m_paused)
 	{
-		device_scheduler * scheduler;
+		device_scheduler *scheduler;
 		scheduler = &(machine->scheduler());
 
-		// Emscripten will call this function at 60Hz, so step the simulation
-		// forward for the amount of time that has passed since the last frame
-		const attotime frametime(0,HZ_TO_ATTOSECONDS(60));
-		const attotime stoptime(scheduler->time() + frametime);
-
-		while (!machine->m_paused && !machine->scheduled_event_pending() && scheduler->time() < stoptime)
+		// like the native blocking loop, pacing comes from the video throttle;
+		// a paced machine steps the real callback interval (not a fixed 1/60s)
+		// while an unthrottled one emulates until the next callback
+		if (machine->m_video->throttled() && !machine->m_video->fastforward())
 		{
-			scheduler->timeslice();
-			// handle save/load
-			if (machine->m_saveload_schedule != saveload_schedule::NONE)
+			const attotime frametime(0, u64(double(delta) * double(ATTOSECONDS_PER_SECOND) / double(tps)));
+			const attotime stoptime(scheduler->time() + frametime);
+
+			while (!machine->m_paused && !machine->scheduled_event_pending() && scheduler->time() < stoptime)
 			{
-				machine->handle_saveload();
-				break;
+				scheduler->timeslice();
+				// handle save/load
+				if (machine->m_saveload_schedule != saveload_schedule::NONE)
+				{
+					machine->handle_saveload();
+					break;
+				}
+			}
+		}
+		else
+		{
+			// osd_ticks() crosses into javascript: probe sparsely, timer-heavy
+			// guests run thousands of tiny timeslices per budget
+			const osd_ticks_t stop_ticks(now + delta);
+			int slices = 0;
+
+			while (!machine->m_paused && !machine->scheduled_event_pending())
+			{
+				scheduler->timeslice();
+				// handle save/load
+				if (machine->m_saveload_schedule != saveload_schedule::NONE)
+				{
+					machine->handle_saveload();
+					break;
+				}
+				if (++slices >= 128)
+				{
+					slices = 0;
+					if (osd_ticks() >= stop_ticks)
+						break;
+				}
 			}
 		}
 	}
