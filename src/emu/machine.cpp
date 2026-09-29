@@ -1395,14 +1395,25 @@ void system_time::full_time::set(struct tm &t)
 //**************************************************************************
 
 #if defined(__EMSCRIPTEN__)
+#include "../devices/imagedev/cassette.h"
+#include <SDL3/SDL.h>
 
 running_machine * running_machine::emscripten_running_machine;
+static bool s_emscripten_tape_ff = false;
+static bool s_emscripten_motor_off = false;
+static attotime s_emscripten_motor_off_since;
+static void emscripten_check_tape_end();
+
 
 void running_machine::emscripten_main_loop()
 {
 	running_machine *machine = emscripten_running_machine;
 
 	auto profile = g_profiler.start(PROFILER_EXTRA);
+
+	// cassette tape-load watch: stop and restore speed when loading ends
+	if (s_emscripten_tape_ff && !machine->m_paused)
+		emscripten_check_tape_end();
 
 	// execute CPUs if not paused
 	if (!machine->m_paused)
@@ -1443,6 +1454,7 @@ void running_machine::emscripten_set_running_machine(running_machine *machine)
 	EM_ASM (
 		JSMESS.running = true;
 	);
+
 	emscripten_set_main_loop(&(emscripten_main_loop), 0, 1);
 }
 
@@ -1461,6 +1473,97 @@ sound_manager * running_machine::emscripten_get_sound()
 	return &(emscripten_running_machine->sound());
 }
 
+void running_machine::emscripten_set_fastforward(int ffwd)
+{
+	if (!emscripten_running_machine)
+		return;
+	// Replicate the UI fast-forward key's effects rather than its flag:
+	// the UI polls IPT_UI_FAST_FORWARD every frame and clears fastforward
+	// whenever the key is up, so a directly-set flag would not stick.
+	// Throttle-off plus max frameskip is what the key drives underneath.
+	video_manager &video = *emscripten_running_machine->m_video;
+	video.set_throttled(!ffwd);
+	video.set_frameskip(ffwd ? (FRAMESKIP_LEVELS - 1) : 0);
+}
+
+// ---- cassette loading control (what the F2 UI keys drive underneath) ----
+
+static cassette_image_device *emscripten_first_cassette()
+{
+	if (!running_machine::emscripten_get_running_machine())
+		return nullptr;
+	for (cassette_image_device &cass : cassette_device_enumerator(running_machine::emscripten_get_running_machine()->root_device()))
+		return &cass;
+	return nullptr;
+}
+
+static void emscripten_tape_ff_off()
+{
+	s_emscripten_tape_ff = false;
+	s_emscripten_motor_off = false;
+	if (!running_machine::emscripten_get_running_machine())
+		return;
+	video_manager &video = running_machine::emscripten_get_running_machine()->video();
+	video.set_throttled(true);
+	video.set_frameskip(0);
+	EM_ASM({
+		if (typeof JSMAME !== "undefined" && typeof JSMAME.on_tape_end === "function")
+			JSMAME.on_tape_end();
+	});
+}
+
+int running_machine::emscripten_cassette_toggle()
+{
+	cassette_image_device *cass = emscripten_first_cassette();
+	if (!cass)
+		return 0;
+	if (cass->is_playing())
+	{
+		cass->change_state(CASSETTE_STOPPED, CASSETTE_MASK_UISTATE);
+		emscripten_tape_ff_off();
+		return 0;
+	}
+	cass->change_state(CASSETTE_PLAY, CASSETTE_MASK_UISTATE);
+	// replay from the start when the previous load ran the tape to its end
+	cass->seek(0.0, SEEK_SET);
+	s_emscripten_tape_ff = true;
+	video_manager &video = running_machine::emscripten_get_running_machine()->video();
+	video.set_throttled(false);
+	video.set_frameskip(FRAMESKIP_LEVELS - 1);
+	return 1;
+}
+
+static void emscripten_check_tape_end()
+{
+	cassette_image_device *cass = emscripten_first_cassette();
+	// the cassette device stops itself at end of tape (and refuses to play
+	// an image with no length); a stopped tape means loading is over
+	if (!cass || !cass->is_playing())
+	{
+		emscripten_tape_ff_off();
+		return;
+	}
+	// guest released the tape motor for a sustained stretch: the loading
+	// routine is done reading (spectrum-style block loads keep motor on)
+	attotime const now(running_machine::emscripten_get_running_machine()->scheduler().time());
+	if (cass->motor_on())
+	{
+		s_emscripten_motor_off = false;
+		return;
+	}
+	if (!s_emscripten_motor_off)
+	{
+		s_emscripten_motor_off = true;
+		s_emscripten_motor_off_since = now;
+		return;
+	}
+	if (now - s_emscripten_motor_off_since > attotime::from_seconds(1))
+	{
+		cass->change_state(CASSETTE_STOPPED, CASSETTE_MASK_UISTATE);
+		emscripten_tape_ff_off();
+	}
+}
+
 void running_machine::emscripten_soft_reset() {
 	emscripten_running_machine->schedule_soft_reset();
 }
@@ -1473,6 +1576,33 @@ void running_machine::emscripten_exit() {
 void running_machine::emscripten_save(const char *name) {
 	emscripten_running_machine->schedule_save(name);
 }
+
+bool running_machine::emscripten_set_bgfx_chain(const char *chain_name)
+{
+	return emscripten_running_machine && emscripten_running_machine->osd().set_bgfx_screen_chain(chain_name ? chain_name : "");
+}
+
+
+void running_machine::emscripten_resize_window(int width, int height)
+{
+	SDL_Window **wins = SDL_GetWindows(nullptr);
+	if (wins && wins[0])
+		SDL_SetWindowSize(wins[0], width, height);
+	SDL_free(wins);
+}
+
+void running_machine::emscripten_set_keepaspect(int keepaspect)
+{
+	for (int i = 0; ; i++)
+	{
+		render_target *target = emscripten_running_machine->render().target_by_index(i);
+		if (target == nullptr)
+			break;
+		target->set_keepaspect(keepaspect != 0);
+	}
+}
+
+
 void running_machine::emscripten_load(const char *name) {
 	emscripten_running_machine->schedule_load(name);
 }
